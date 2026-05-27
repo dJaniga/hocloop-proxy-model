@@ -21,6 +21,7 @@ from .helpers import (
 )
 from .primitives import build_primitive_set
 from .toolbox import build_toolbox
+from .. import Regressor
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ def _evolve_island_worker(args: tuple) -> list[gp.PrimitiveTree]:
 
 
 @dataclass
-class SymbolicRegressor:
+class SymbolicRegressor(Regressor):
     """Hybrid symbolic regressor: GP + NSGA-II + island migration + SymPy simplification.
 
     Supports **single-target** and **multi-target** regression with the same
@@ -433,17 +434,17 @@ class SymbolicRegressor:
                 f"n_islands={self.n_islands} (need at least 4 per island)."
             )
 
-        logger.debug(
-            "Initializing symbolic regression",
-            extra={
-                "population": self.population_size,
-                "generations": self.generations,
-                "islands": self.n_islands,
-                "island_size": island_size,
-                "n_targets": n_targets,
-                "parsimony_coefficient": self.parsimony_coefficient,
-            },
-        )
+        # logger.debug(
+        #     "Initializing symbolic regression",
+        #     extra={
+        #         "population": self.population_size,
+        #         "generations": self.generations,
+        #         "islands": self.n_islands,
+        #         "island_size": island_size,
+        #         "n_targets": n_targets,
+        #         "parsimony_coefficient": self.parsimony_coefficient,
+        #     },
+        # )
 
         # ---- initial population --------------------------------------------
         seed_individuals = build_seed_individuals(self._pset, n_features)
@@ -604,17 +605,17 @@ class SymbolicRegressor:
                 else:
                     best_islands_snapshot = islands
 
-                logger.debug(
-                    "Generation complete",
-                    extra={
-                        "generation": generation,
-                        "best_mean_mse": _mean_mse(best.fitness.values)
-                        if best
-                        else None,  # type: ignore[attr-defined]
-                        "best_len": len(best) if best else None,
-                        "cache_size": len(self._fitness_cache),
-                    },
-                )
+                # logger.debug(
+                #     "Generation complete",
+                #     extra={
+                #         "generation": generation,
+                #         "best_mean_mse": _mean_mse(best.fitness.values)
+                #         if best
+                #         else None,  # type: ignore[attr-defined]
+                #         "best_len": len(best) if best else None,
+                #         "cache_size": len(self._fitness_cache),
+                #     },
+                # )
         finally:
             if executor is not None:
                 executor.shutdown(wait=True)
@@ -648,7 +649,7 @@ class SymbolicRegressor:
             raise RuntimeError("Symbolic regression did not produce a valid model.")
 
         self._fitness_cache.clear()
-        logger.debug("Symbolic regression complete", extra=self.get_fit_details())
+        # logger.debug("Symbolic regression complete", extra=self.get_fit_details())
         return self
 
     def predict(self, features: np.ndarray) -> np.ndarray:
@@ -666,10 +667,10 @@ class SymbolicRegressor:
         func = gp.compile(self.best_individual_, self._pset)
         predictions_std = vectorised_evaluate(func, features_std)
         predictions = self._unstandardize_predictions(predictions_std)
-        logger.debug(
-            "Symbolic prediction complete",
-            extra={"samples": int(features.shape[0]), "n_targets": self._n_targets},
-        )
+        # logger.debug(
+        #     "Symbolic prediction complete",
+        #     extra={"samples": int(features.shape[0]), "n_targets": self._n_targets},
+        # )
         return predictions
 
     def predict_target(self, features: np.ndarray, target_idx: int) -> np.ndarray:

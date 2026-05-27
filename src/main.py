@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 def setup_logging():
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.FileHandler("hocloop-proxy-model.log", encoding="utf-8"),
@@ -35,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
+    parser.add_argument("--output-path", type=Path, help="Path to the output file", required=True)
+
     return parser
 
 
@@ -43,7 +45,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    pipeline(args.features_file, args.targets_file)
+    pipeline(args.features_file, args.targets_file, args.output_path)
 
 
 if __name__ == "__main__":

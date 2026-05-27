@@ -236,10 +236,10 @@ def _simplify_individual(
 
     individual[0 : len(individual)] = new_tokens
     individual.fitness.values = new_fitness  # type: ignore[attr-defined]
-    logger.debug(
-        "Individual simplified",
-        extra={"before": original_len, "after": len(new_tokens)},
-    )
+    # logger.debug(
+    #     "Individual simplified",
+    #     extra={"before": original_len, "after": len(new_tokens)},
+    # )
     return True
 
 
@@ -268,8 +268,8 @@ def simplify_island(
             n_features,
         ):
             simplified_count += 1
-    if simplified_count > 0:
-        logger.debug(
-            "Island simplification pass",
-            extra={"simplified": simplified_count, "total": len(island)},
-        )
+    # if simplified_count > 0:
+    #     logger.debug(
+    #         "Island simplification pass",
+    #         extra={"simplified": simplified_count, "total": len(island)},
+    #     )

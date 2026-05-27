@@ -120,10 +120,10 @@ def build_seed_individuals(
         except Exception:
             continue
 
-    logger.debug(
-        "Seed individuals created",
-        extra={"count": len(individuals), "n_features": n_features},
-    )
+    # logger.debug(
+    #     "Seed individuals created",
+    #     extra={"count": len(individuals), "n_features": n_features},
+    # )
     return individuals
 
 
@@ -355,7 +355,7 @@ def migrate(
         islands[dest] = [ind for ind in dest_island if id(ind) not in worst_set]
         islands[dest].extend(emigrants[i])
 
-    logger.debug(
-        "Migration complete",
-        extra={"islands": n, "migrants_per_island": migration_size},
-    )
+    # logger.debug(
+    #     "Migration complete",
+    #     extra={"islands": n, "migrants_per_island": migration_size},
+    # )

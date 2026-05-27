@@ -81,12 +81,12 @@ def build_toolbox(
     max_nodes = max_tree_height * 4
     toolbox.decorate("mate", gp.staticLimit(key=len, max_value=max_nodes))
     toolbox.decorate("mutate", gp.staticLimit(key=len, max_value=max_nodes))
-    logger.debug(
-        "Symbolic toolbox ready",
-        extra={
-            "max_height": max_tree_height,
-            "tournament": tournament_size,
-            "n_targets": n_targets,
-        },
-    )
+    # logger.debug(
+    #     "Symbolic toolbox ready",
+    #     extra={
+    #         "max_height": max_tree_height,
+    #         "tournament": tournament_size,
+    #         "n_targets": n_targets,
+    #     },
+    # )
     return toolbox
