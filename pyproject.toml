@@ -1,0 +1,12 @@
+[project]
+name = "hocloop-proxy-model"
+version = "0.1.0"
+description = ""
+requires-python = ">=3.14"
+dependencies = [
+    "deap>=1.4.4",
+    "numpy>=2.4.6",
+    "scipy>=1.17.1",
+    "sympy>=1.14.0",
+    "tqdm>=4.67.3",
+]
