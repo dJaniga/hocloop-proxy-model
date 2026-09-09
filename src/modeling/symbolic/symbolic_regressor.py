@@ -172,17 +172,15 @@ def _evolve_island_worker(args: tuple) -> list[gp.PrimitiveTree]:
 class SymbolicRegressor(Regressor):
     """Hybrid symbolic regressor: GP + NSGA-II + island migration + SymPy simplification.
 
-    Supports **single-target** and **multi-target** regression with the same
-    interface.  When ``targets`` passed to :meth:`fit` has shape
-    ``(n_samples, n_targets)``, the fitness vector becomes
-    ``(mse_t0, mse_t1, ..., mse_t_{n-1}, complexity)`` and NSGA-II optimises
-    all objectives simultaneously.  ``predict`` then returns an array of shape
-    ``(n_samples, n_targets)`` (or ``(n_samples,)`` for single-target).
+    Evolves one expression for one target.  Fitness is the pair
+    ``(mse, complexity)``, both minimised, so NSGA-II returns an accuracy versus
+    complexity Pareto front rather than a single model.
 
-    The single symbolic tree that is learnt represents a *shared expression*:
-    one formula whose output is compared against every target.  This is
-    appropriate when the targets are related and a common functional form is
-    expected (e.g. different sensor channels measuring the same phenomenon).
+    For several targets use :class:`MultiTargetSymbolicRegressor`, which runs an
+    independent search per target.  A single expression cannot serve several
+    targets at once: comparing one output against every target column forces the
+    standardised predictions to coincide, which is only correct if the targets
+    are perfectly correlated.
     """
 
     population_size: int = 200
@@ -245,6 +243,16 @@ class SymbolicRegressor(Regressor):
         targets = np.asarray(targets, dtype=np.float64)
         if targets.ndim == 1:
             targets = targets.reshape(-1, 1)
+
+        if targets.shape[1] > 1:
+            raise ValueError(
+                "SymbolicRegressor learns a single expression and therefore a single "
+                f"target, but got {targets.shape[1]}. A single expression cannot fit "
+                "several targets at once: after standardisation it would predict the "
+                "same values for all of them, which is only correct when the targets "
+                "are perfectly correlated. Use MultiTargetSymbolicRegressor, which "
+                "evolves one expression per target."
+            )
 
         if fit:
             self._n_targets = targets.shape[1]

@@ -25,6 +25,29 @@ _METRICS = {
     "root_mean_squared_log_error",
 }
 
+#: Metrics computed here rather than taken from scikit-learn.
+_DERIVED_METRICS = {"r2_log_score"}
+
+
+def _r2_log_score(
+    y_true: np.ndarray, y_pred: np.ndarray, sample_weight: np.ndarray | None
+) -> float:
+    """R-squared computed on log values, for strictly positive targets.
+
+    Raw R-squared is a poor summary of a target spanning several orders of
+    magnitude: the sum of squares is dominated by the largest few samples, so a
+    model that is accurate in relative terms everywhere can still score
+    negatively because of a handful of extreme points.  Scoring the logs weights
+    every sample by its relative error instead, which is what a proxy for a cost
+    or a power output is actually judged on.
+
+    Returns NaN when either array contains a non-positive value, since the log
+    is undefined there.
+    """
+    if np.any(y_true <= 0) or np.any(y_pred <= 0):
+        return float("nan")
+    return float(skm.r2_score(np.log(y_true), np.log(y_pred), sample_weight=sample_weight))
+
 
 def _compute_metrics_1d(
     y_actual: np.ndarray,
@@ -35,7 +58,7 @@ def _compute_metrics_1d(
     """Compute all regression metrics for a single pair of 1-D arrays."""
     valid = mask & np.isfinite(y_actual) & np.isfinite(y_pred)
     if valid.size == 0 or not np.any(valid):
-        return {name: float("nan") for name in _METRICS}
+        return {name: float("nan") for name in _METRICS | _DERIVED_METRICS}
 
     y_true_v = y_actual[valid]
     y_pred_v = y_pred[valid]
@@ -54,6 +77,11 @@ def _compute_metrics_1d(
             results[name] = float(np.mean(value))
         except Exception:
             results[name] = float("nan")
+
+    try:
+        results["r2_log_score"] = _r2_log_score(y_true_v, y_pred_v, sw)
+    except Exception:
+        results["r2_log_score"] = float("nan")
     return results
 
 
