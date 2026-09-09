@@ -32,6 +32,7 @@ from modeling.design_rules import (
 from modeling.learners import LEARNER_FACTORIES, build_learner_factory
 from modeling.proxy import ProxyConfig, StructuredProxyModel
 from modeling.transforms import columns_from_matrix
+from modeling.tuning import LEARNER_SPACES, TunedProxyModel, TuningSettings
 from modeling.validation import learning_curve
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,20 @@ class ExperimentSettings:
     run_design_rules: bool = True
     seed: int | None = 0
     symbolic_overrides: dict[str, Any] = field(default_factory=dict)
+    #: Search hyperparameters inside every training fold, giving nested CV.
+    tune: bool = False
+    #: Optuna trials per fit. The search runs once per fold, so the total cost is
+    #: this times the number of fits, which is why it is off by default.
+    n_trials: int = 25
+    #: Inner folds used to score a trial.
+    inner_splits: int = 3
+    #: Objective for the search. Defaults to log-scale R-squared because raw
+    #: R-squared on these targets is decided by a few extreme points.
+    tuning_metric: str = "r2_log_score"
+    #: Also search the feature space and the power-law refinement switch.
+    tune_pipeline: bool = False
+    #: Learners to tune. Empty means every learner that has a search space.
+    tune_learners: tuple[str, ...] = ()
 
 
 def load_data(file: Path) -> pd.DataFrame:
@@ -157,6 +172,67 @@ def _symbolic_factory(settings: ExperimentSettings) -> Callable[[], Any]:
     return build_learner_factory(settings.primary_learner, **settings.symbolic_overrides)
 
 
+def _tuning_settings(settings: ExperimentSettings) -> TuningSettings:
+    return TuningSettings(
+        n_trials=settings.n_trials,
+        inner_splits=settings.inner_splits,
+        metric=settings.tuning_metric,
+        search_pipeline=settings.tune_pipeline,
+        seed=settings.seed,
+    )
+
+
+def _should_tune(settings: ExperimentSettings, label: str) -> bool:
+    if not settings.tune or label not in LEARNER_SPACES:
+        return False
+    return not settings.tune_learners or label in settings.tune_learners
+
+
+def _model_factory_for(
+    settings: ExperimentSettings, config: ProxyConfig
+) -> Callable[[str, Callable[[], Any]], Callable[[], Any]]:
+    """Wrap each learner in a self-tuning model when tuning is enabled."""
+    tuning = _tuning_settings(settings)
+
+    def build(label: str, learner_factory: Callable[[], Any]) -> Callable[[], Any]:
+        if _should_tune(settings, label):
+            def tuned_factory(_label=label) -> TunedProxyModel:
+                return TunedProxyModel(
+                    learner_name=_label, config=config, settings=tuning
+                )
+
+            return tuned_factory
+
+        def plain_factory(_factory=learner_factory) -> StructuredProxyModel:
+            return StructuredProxyModel(learner_factory=_factory, config=config)
+
+        return plain_factory
+
+    return build
+
+
+def _primary_model_factory(
+    settings: ExperimentSettings, config: ProxyConfig
+) -> Callable[[], Any]:
+    """Model factory for the reference learner, tuned when tuning is enabled."""
+    if _should_tune(settings, settings.primary_learner):
+        tuning = _tuning_settings(settings)
+
+        def tuned() -> TunedProxyModel:
+            return TunedProxyModel(
+                learner_name=settings.primary_learner, config=config, settings=tuning
+            )
+
+        return tuned
+
+    factory = _symbolic_factory(settings)
+
+    def plain() -> StructuredProxyModel:
+        return StructuredProxyModel(learner_factory=factory, config=config)
+
+    return plain
+
+
 def _learner_factories(settings: ExperimentSettings) -> dict[str, Callable[[], Any]]:
     factories: dict[str, Callable[[], Any]] = {}
     for name in settings.learners:
@@ -175,16 +251,18 @@ def _learner_factories(settings: ExperimentSettings) -> dict[str, Callable[[], A
 def _run_conformal(
     settings: ExperimentSettings,
     config: ProxyConfig,
-    learner_factory: Callable[[], Any],
+    model_factory: Callable[[], Any],
     features: np.ndarray,
     targets: np.ndarray,
     feature_names: Sequence[str],
     target_names: Sequence[str],
 ) -> dict[str, Any]:
-    """Calibrate a log-scale conformal radius and propagate it to every target."""
-    def model_factory() -> StructuredProxyModel:
-        return StructuredProxyModel(learner_factory=learner_factory, config=config)
+    """Calibrate a log-scale conformal radius and propagate it to every target.
 
+    ``model_factory`` must return a fresh, unfitted model, so a self-tuning
+    model re-runs its search on each calibration fold and the conformal scores
+    stay out of sample.
+    """
     fitted = model_factory()
     fitted.fit(features, targets, tuple(feature_names), tuple(target_names))
     independent = fitted.structure_.independent_targets  # type: ignore[union-attr]
@@ -321,15 +399,24 @@ def pipeline(
 
     config = build_config(feature_names, target_names, units_file)
     symbolic_factory = _symbolic_factory(settings)
+    primary_factory = _primary_model_factory(settings, config)
+    if settings.tune:
+        logger.info(
+            "Hyperparameter search enabled: %d trials, %d inner folds, objective %s. "
+            "The search runs inside every fit, so reported scores are nested.",
+            settings.n_trials, settings.inner_splits, settings.tuning_metric,
+        )
 
     # ---------------------------------------------------------------- #
     # Final model on all data: structure, dimensional analysis, formula  #
     # ---------------------------------------------------------------- #
     logger.info("Fitting the reference model on the full design.")
-    model = StructuredProxyModel(learner_factory=symbolic_factory, config=config)
+    model = primary_factory()
     model.fit(features, targets, feature_names, target_names)
 
     details = model.get_fit_details()
+    if settings.tune and "tuning" in details:
+        _write_json(output_path / "hyperparameters.json", details["tuning"])
     _write_json(output_path / "target_structure.json", details["structure"])
     _write_json(
         output_path / "dimensional_analysis.json",
@@ -364,12 +451,17 @@ def pipeline(
     if settings.run_benchmarks:
         entries = learner_comparison(
             _learner_factories(settings), config, features, targets,
-            feature_names, target_names, **common,
+            feature_names, target_names,
+            model_factory_for=_model_factory_for(settings, config),
+            **common,
         )
         _write_json(output_path / "benchmark_learners.json", [e.to_dict() for e in entries])
         _write_csv(output_path / "benchmark_learners.csv", to_dataframe(entries))
 
     if settings.run_ablation:
+        # The ablation isolates pipeline stages, so it holds the learner fixed at
+        # its configured hyperparameters; tuning here would confound a stage's
+        # contribution with the search's ability to compensate for its removal.
         entries = ablation_study(
             symbolic_factory, config, features, targets,
             feature_names, target_names, **common,
@@ -378,11 +470,8 @@ def pipeline(
         _write_csv(output_path / "ablation.csv", to_dataframe(entries))
 
     if settings.run_learning_curve:
-        def model_factory() -> StructuredProxyModel:
-            return StructuredProxyModel(learner_factory=symbolic_factory, config=config)
-
         curve = learning_curve(
-            model_factory, features, targets, feature_names, target_names,
+            primary_factory, features, targets, feature_names, target_names,
             train_sizes=settings.learning_curve_sizes,
             n_repeats=settings.learning_curve_repeats,
             seed=settings.seed,
@@ -403,7 +492,7 @@ def pipeline(
 
     if settings.run_conformal:
         report = _run_conformal(
-            settings, config, symbolic_factory, features, targets,
+            settings, config, primary_factory, features, targets,
             feature_names, target_names,
         )
         _write_json(output_path / "conformal_intervals.json", report)

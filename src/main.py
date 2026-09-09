@@ -88,6 +88,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evolve islands in worker processes.",
     )
 
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Search hyperparameters inside every training fold. The search runs "
+        "once per fit, so reported scores are nested cross-validation, and the "
+        "cost is n_trials times the number of fits.",
+    )
+    parser.add_argument("--n-trials", type=int, default=25, help="Optuna trials per fit.")
+    parser.add_argument("--inner-splits", type=int, default=3, help="Inner folds per trial.")
+    parser.add_argument(
+        "--tuning-metric",
+        default="r2_log_score",
+        help="Objective for the search. Log-scale R-squared by default, because "
+        "raw R-squared on these targets is decided by a few extreme points.",
+    )
+    parser.add_argument(
+        "--tune-pipeline",
+        action="store_true",
+        help="Also search the feature space and the power-law refinement switch.",
+    )
+    parser.add_argument(
+        "--tune-learners",
+        nargs="+",
+        default=[],
+        help="Learners to tune. Default: every learner that has a search space.",
+    )
+
     parser.add_argument("--skip-benchmarks", action="store_true")
     parser.add_argument("--skip-ablation", action="store_true")
     parser.add_argument("--skip-learning-curve", action="store_true")
@@ -129,6 +156,12 @@ def settings_from_args(args: argparse.Namespace) -> ExperimentSettings:
         run_design_rules=not args.skip_design_rules,
         seed=args.seed,
         symbolic_overrides=symbolic_overrides,
+        tune=args.tune,
+        n_trials=5 if args.quick else args.n_trials,
+        inner_splits=2 if args.quick else args.inner_splits,
+        tuning_metric=args.tuning_metric,
+        tune_pipeline=args.tune_pipeline,
+        tune_learners=tuple(args.tune_learners),
     )
 
 

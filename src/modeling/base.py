@@ -91,7 +91,6 @@ class ModelWrapper:
         targets: np.ndarray,
         features_name: tuple[str, ...] | None = None,
         targets_name: tuple[str, ...] | None = None,
-        optimize_hyperparameters: bool = False,
         tuning_metric: str = "mean_squared_error",
         outer_splits: int = 5,
         inner_splits: int = 5,
@@ -109,9 +108,9 @@ class ModelWrapper:
         _targets_name = _resolve_targets_name(targets_name, n_targets)
 
         # ------------------------------------------------------------------ #
-        # 1. NESTED CROSS-VALIDATION — unbiased generalization estimate        #
-        #    Outer fold: held-out eval                                         #
-        #    Inner fold (optional): hyperparameter tuning                      #
+        # 1. CROSS-VALIDATION — generalization estimate                        #
+        #    Hyperparameter tuning now lives in modeling.tuning, where a model  #
+        #    tunes itself inside its own fit and so nests automatically.        #
         # ------------------------------------------------------------------ #
         outer_kf = KFold(n_splits=outer_splits, shuffle=True, random_state=self.seed)
 
@@ -136,22 +135,6 @@ class ModelWrapper:
             )
 
             fold_model = copy.deepcopy(self.model)
-
-            if optimize_hyperparameters:
-                from modeling.tuning import tune_hyperparameters
-
-                fold_model = tune_hyperparameters(
-                    fold_model,
-                    X_outer_train,
-                    y_outer_train,
-                    tuning_metric=tuning_metric,
-                    features_name=_features_name,
-                    targets_name=_targets_name,
-                    seed=self.seed,
-                    n_splits=inner_splits,
-                    n_jobs=self.n_jobs,
-                )
-
             fold_model.fit(
                 X_outer_train,
                 y_outer_train,
@@ -196,21 +179,6 @@ class ModelWrapper:
         #    Hyperparameters tuned on all data via inner CV (no holdout leak) #
         # ------------------------------------------------------------------ #
         logger.debug("Training final model on full dataset")
-
-        if optimize_hyperparameters:
-            from modeling.tuning import tune_hyperparameters
-
-            self.model = tune_hyperparameters(
-                self.model,
-                features,
-                targets,
-                tuning_metric=tuning_metric,
-                features_name=_features_name,
-                targets_name=_targets_name,
-                seed=self.seed,
-                n_splits=inner_splits,
-                n_jobs=self.n_jobs,
-            )
 
         self.model.fit(
             features, targets,

@@ -1,255 +1,402 @@
+"""Hyperparameter optimisation for the structured proxy model.
+
+Tuning happens **inside** :meth:`TunedProxyModel.fit`, using only the data that
+method is given.  That single decision is what keeps the reported numbers
+honest: every protocol in :mod:`modeling.validation` already refits the model on
+each training split, so a model that tunes itself during ``fit`` produces proper
+nested cross-validation with no extra machinery and no possibility of the search
+seeing the evaluation fold.  Tuning once on the whole design and then
+cross-validating the winner would report the score of a model chosen with
+knowledge of the test data.
+
+Two things can be searched:
+
+*Learner hyperparameters* -- the genetic-programming budget and pressure, or the
+usual knobs of the black-box baselines.
+
+*Pipeline choices* -- the feature space and whether the power-law refinement is
+applied.  These are ordinary hyperparameters too, and treating them as such
+avoids fixing by hand a choice the data can settle.
+
+The default objective is ``r2_log_score`` rather than raw R-squared, because a
+target spanning four orders of magnitude makes raw R-squared a lottery on a few
+extreme points, and tuning against a noisy objective mostly fits the noise.
+"""
+
 from __future__ import annotations
 
-import copy
 import logging
-from typing import Sequence
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import optuna
 from sklearn.model_selection import KFold
 
-from modeling import Regressor
-from modeling.symbolic import SymbolicRegressor
-from modeling.tuning_metrics import evaluate_metric, get_metric_direction, MAXIMIZE_METRICS
+from modeling.base import Regressor
+from modeling.fit_metrics import run_regression_metrics_per_target
+from modeling.learners import build_learner_factory
+from modeling.proxy import ProxyConfig, StructuredProxyModel
 
 logger = logging.getLogger(__name__)
 
-
-def _n_targets_from(targets: np.ndarray) -> int:
-    return targets.shape[1] if targets.ndim == 2 and targets.shape[1] > 1 else 1
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
-def _per_target_mse(y_val: np.ndarray, preds: np.ndarray, n_targets: int) -> list[float]:
-    """Return a list of per-target MSE values, one per target column."""
-    mses = []
-    for k in range(n_targets):
-        y_k = y_val[:, k] if n_targets > 1 else (y_val[:, 0] if y_val.ndim == 2 else y_val)
-        p_k = preds[:, k] if n_targets > 1 else (preds[:, 0] if preds.ndim == 2 else preds)
-        diff = y_k - p_k
-        mses.append(float(np.dot(diff, diff) / len(diff)))
-    return mses
+# --------------------------------------------------------------------------- #
+# Search spaces                                                                #
+# --------------------------------------------------------------------------- #
 
 
-def _select_best_trial_multiobjective(
-    trials: Sequence[optuna.trial.FrozenTrial],
-    n_targets: int,
-) -> optuna.trial.FrozenTrial:
-    """Pick the best trial from a Pareto front using mean MSE across target objectives.
+def _symbolic_space(trial: optuna.Trial) -> dict[str, Any]:
+    """Budget and selection pressure for the genetic-programming learners."""
+    return {
+        "population_size": trial.suggest_int("population_size", 100, 600, step=50),
+        "generations": trial.suggest_int("generations", 40, 200, step=20),
+        "max_tree_height": trial.suggest_int("max_tree_height", 3, 8),
+        "parsimony_coefficient": trial.suggest_float(
+            "parsimony_coefficient", 1e-4, 1e-2, log=True
+        ),
+        "n_islands": trial.suggest_int("n_islands", 1, 5),
+        "basic_arithmetic_only": trial.suggest_categorical(
+            "basic_arithmetic_only", [True, False]
+        ),
+    }
 
-    The objective vector is ``(mse_t0, ..., mse_t_{n-1}, complexity)`` — all
-    minimised.  Target objectives are indices ``0 .. n_targets-1``; complexity
-    is the last index.  We select the trial with the lowest mean across the
-    target objectives, which mirrors ``_best_by_mean_mse`` in the regressor.
-    """
-    return min(
-        trials,
-        key=lambda t: float(np.mean(t.values[:n_targets])),  # type: ignore[index]
+
+def _symbolic_deap_space(trial: optuna.Trial) -> dict[str, Any]:
+    space = _symbolic_space(trial)
+    space.update(
+        {
+            "tournament_size": trial.suggest_int("tournament_size", 2, 7),
+            "mutation_rate": trial.suggest_float("mutation_rate", 0.05, 0.5),
+            "crossover_rate": trial.suggest_float("crossover_rate", 0.4, 0.95),
+        }
     )
+    return space
 
 
-def tune_hyperparameters(
-        model: Regressor,
+def _pysr_space(trial: optuna.Trial) -> dict[str, Any]:
+    return {
+        "niterations": trial.suggest_int("niterations", 20, 120, step=20),
+        "maxsize": trial.suggest_int("maxsize", 15, 40, step=5),
+        "populations": trial.suggest_int("populations", 8, 30),
+        "population_size": trial.suggest_int("population_size", 20, 60, step=10),
+    }
+
+
+def _gradient_boosting_space(trial: optuna.Trial) -> dict[str, Any]:
+    return {
+        "max_iter": trial.suggest_int("max_iter", 200, 1200, step=100),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 15, 127, log=True),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 50),
+        "l2_regularization": trial.suggest_float("l2_regularization", 1e-6, 1.0, log=True),
+    }
+
+
+def _random_forest_space(trial: optuna.Trial) -> dict[str, Any]:
+    return {
+        "n_estimators": trial.suggest_int("n_estimators", 200, 800, step=100),
+        "max_depth": trial.suggest_int("max_depth", 5, 40),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 20),
+        "max_features": trial.suggest_float("max_features", 0.3, 1.0),
+    }
+
+
+def _neural_network_space(trial: optuna.Trial) -> dict[str, Any]:
+    width = trial.suggest_categorical("width", [64, 128, 256])
+    depth = trial.suggest_int("depth", 2, 4)
+    return {
+        "mlpregressor__hidden_layer_sizes": tuple([width] * depth),
+        "mlpregressor__alpha": trial.suggest_float("alpha", 1e-7, 1e-2, log=True),
+        "mlpregressor__learning_rate_init": trial.suggest_float(
+            "learning_rate_init", 1e-4, 1e-2, log=True
+        ),
+        "mlpregressor__max_iter": trial.suggest_int("max_iter", 400, 1600, step=200),
+    }
+
+
+def _polynomial_ridge_space(trial: optuna.Trial) -> dict[str, Any]:
+    return {"polynomialfeatures__degree": trial.suggest_int("degree", 2, 4)}
+
+
+#: Learner name to the function that samples its hyperparameters.  A learner
+#: absent from this mapping has nothing to tune and is fitted as configured.
+LEARNER_SPACES: dict[str, Callable[[optuna.Trial], dict[str, Any]]] = {
+    "symbolic_deap": _symbolic_deap_space,
+    "symbolic_residual": _symbolic_space,
+    "symbolic_pysr": _pysr_space,
+    "gradient_boosting": _gradient_boosting_space,
+    "random_forest": _random_forest_space,
+    "neural_network": _neural_network_space,
+    "polynomial_ridge": _polynomial_ridge_space,
+}
+
+
+def _pipeline_space(trial: optuna.Trial) -> dict[str, Any]:
+    """Pipeline choices that are hyperparameters like any other."""
+    return {
+        "feature_space": trial.suggest_categorical(
+            "feature_space", ["log_pi_plus_raw", "log_pi", "raw"]
+        ),
+        "refine_power_law": trial.suggest_categorical("refine_power_law", [True, False]),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Scoring                                                                      #
+# --------------------------------------------------------------------------- #
+
+
+def _score(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    target_names: Sequence[str],
+    metric: str,
+) -> float:
+    """Mean of *metric* across targets, higher being better."""
+    per_target = run_regression_metrics_per_target(
+        actual, predicted, target_names=tuple(target_names)
+    )
+    values = [
+        per_target[name][metric]
+        for name in target_names
+        if not np.isnan(per_target[name].get(metric, np.nan))
+    ]
+    if not values:
+        return -np.inf
+    mean = float(np.mean(values))
+    # Error metrics improve as they fall, so negate them for a maximising study.
+    if metric.startswith("r2") or metric.startswith("d2") or "explained" in metric:
+        return mean
+    return -mean
+
+
+# --------------------------------------------------------------------------- #
+# The tuned model                                                              #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class TuningSettings:
+    """How hard to search, and over what."""
+
+    n_trials: int = 25
+    inner_splits: int = 3
+    metric: str = "r2_log_score"
+    search_pipeline: bool = False
+    timeout: float | None = None
+    seed: int | None = 0
+    #: Overrides applied to every trial, e.g. a reduced budget during tuning.
+    fixed_overrides: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TunedProxyModel(Regressor):
+    """A :class:`StructuredProxyModel` that tunes itself on its training data.
+
+    Because the search runs inside :meth:`fit`, dropping this into any protocol
+    in :mod:`modeling.validation` yields nested cross-validation: the outer split
+    supplies the training data, the inner split selects hyperparameters, and the
+    evaluation fold is never seen by the search.
+    """
+
+    learner_name: str
+    config: ProxyConfig = field(default_factory=ProxyConfig)
+    settings: TuningSettings = field(default_factory=TuningSettings)
+    name: str = "tuned_proxy"
+
+    model_: StructuredProxyModel | None = None
+    best_params_: dict[str, Any] = field(default_factory=dict)
+    best_pipeline_params_: dict[str, Any] = field(default_factory=dict)
+    inner_score_: float = float("nan")
+    n_trials_completed_: int = 0
+
+    def __str__(self) -> str:
+        return f"{self.name}_{self.learner_name}"
+
+    # -- helpers -------------------------------------------------------- #
+
+    def _build(
+        self, learner_params: dict[str, Any], pipeline_params: dict[str, Any]
+    ) -> StructuredProxyModel:
+        overrides = {**self.settings.fixed_overrides, **learner_params}
+        factory = build_learner_factory(self.learner_name, **overrides)
+        config = replace(self.config, **pipeline_params) if pipeline_params else self.config
+        return StructuredProxyModel(learner_factory=factory, config=config)
+
+    # -- fitting -------------------------------------------------------- #
+
+    def fit(
+        self,
         features: np.ndarray,
         targets: np.ndarray,
-        features_name: tuple[str, ...],
-        targets_name: tuple[str, ...] | None,
-        n_trials: int = 50,
-        n_splits: int = 3,
-        tuning_metric: str = "mean_squared_error",
-        seed: int | None = None,
-        n_jobs: int | None = None,
-) -> Regressor:
-    if not isinstance(model, SymbolicRegressor):
-        logger.warning(
-            f"Hyperparameter tuning not implemented for {type(model).__name__}. "
-            "Returning original model."
+        features_name: tuple[str, ...] | None = None,
+        targets_name: tuple[str, ...] | None = None,
+        eval_set: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> TunedProxyModel:
+        features = np.asarray(features, dtype=np.float64)
+        targets = np.asarray(targets, dtype=np.float64)
+        if targets.ndim == 1:
+            targets = targets.reshape(-1, 1)
+        names = tuple(
+            targets_name or tuple(f"target_{k}" for k in range(targets.shape[1]))
         )
-        return model
+        feature_names = tuple(
+            features_name or tuple(f"ARG{i}" for i in range(features.shape[1]))
+        )
 
-    n_targets = _n_targets_from(targets)
-    is_multiobjective = n_targets > 1
+        space = LEARNER_SPACES.get(self.learner_name)
+        if space is None and not self.settings.search_pipeline:
+            logger.info("Nothing to tune for %r; fitting as configured.", self.learner_name)
+            self.model_ = self._build({}, {})
+            self.model_.fit(features, targets, feature_names, names)
+            return self
 
-    # ------------------------------------------------------------------
-    # Objective function
-    # ------------------------------------------------------------------
-    # Multi-target: returns a tuple (mse_t0_cv, ..., mse_t_{n-1}_cv, complexity_cv)
-    #   mirroring the regressor's NSGA-II fitness vector so Optuna's Pareto
-    #   front is comparable to the GP Pareto front.
-    # Single-target: returns a single float (the CV mean of tuning_metric),
-    #   unchanged from the previous behaviour.
-    # ------------------------------------------------------------------
+        folds = KFold(
+            n_splits=self.settings.inner_splits,
+            shuffle=True,
+            random_state=self.settings.seed,
+        )
+        splits = list(folds.split(features))
 
-    def objective(trial: optuna.Trial) -> tuple[float, ...] | float:
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        def objective(trial: optuna.Trial) -> float:
+            learner_params = space(trial) if space is not None else {}
+            pipeline_params = _pipeline_space(trial) if self.settings.search_pipeline else {}
 
-        # Accumulators: one list per target MSE + one for complexity
-        cv_mses: list[list[float]] = [[] for _ in range(n_targets)]
-        cv_complexities: list[float] = []
-        # Single-target only: arbitrary tuning_metric accumulator
-        cv_scalar: list[float] = []
-
-        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(features)):
-            logger.debug(
-                f"Inner CV fold {fold_idx + 1}/{n_splits} — "
-                f"{type(model).__name__} hyperparameter tuning"
-            )
-            X_train, X_val = features[train_idx], features[val_idx]
-            y_train, y_val = targets[train_idx], targets[val_idx]
-
-            trial_model = copy.deepcopy(model)
-
-            if isinstance(trial_model, SymbolicRegressor):
-                if isinstance(trial_model, SymbolicRegressor):
-                    trial_model.population_size = trial.suggest_int(
-                        "population_size", 50, 500, step=50
+            fold_scores: list[float] = []
+            for index, (train_index, valid_index) in enumerate(splits):
+                candidate = self._build(learner_params, pipeline_params)
+                try:
+                    candidate.fit(
+                        features[train_index], targets[train_index], feature_names, names
                     )
-                    trial_model.generations = trial.suggest_int(
-                        "generations", 20, 200, step=10
+                    predicted = np.asarray(
+                        candidate.predict(features[valid_index]), dtype=np.float64
                     )
-                    trial_model.mutation_rate = trial.suggest_float(
-                        "mutation_rate", 0.05, 0.5
-                    )
-                    trial_model.crossover_rate = trial.suggest_float(
-                        "crossover_rate", 0.4, 0.95
-                    )
-                    trial_model.tournament_size = trial.suggest_int(
-                        "tournament_size", 2, 10
-                    )
-                    trial_model.max_tree_height = trial.suggest_int(
-                        "max_tree_height", 2, 12
-                    )
-                    trial_model.n_islands = trial.suggest_int(
-                        "n_islands", 1, 8
-                    )
-                    trial_model.migration_interval = trial.suggest_int(
-                        "migration_interval", 2, 20
-                    )
-                    trial_model.migration_size = trial.suggest_int(
-                        "migration_size", 1, 10
-                    )
-                    trial_model.simplify_interval = trial.suggest_int(
-                        "simplify_interval", 5, 30, step=5
-                    )
-                    trial_model.parsimony_coefficient = trial.suggest_float(
-                        "parsimony_coefficient", 0.0001, 0.01, log=True
-                    )
-                    trial_model.basic_arithmetic_only = trial.suggest_categorical(
-                        "basic_arithmetic_only", [True, False]
-                    )
-                    trial_model.const_opt_top_k_ratio = trial.suggest_float(
-                        "const_opt_top_k_ratio", 0.1, 0.5
-                    )
-
-            trial_model.fit(
-                X_train, y_train,
-                features_name=features_name,
-                targets_name=targets_name,
-                eval_set=(X_val, y_val),
-            )
-            preds = trial_model.predict(X_val)
-
-            # Per-target MSE — mirrors the regressor's evaluate_individual output
-            fold_mses = _per_target_mse(y_val, preds, n_targets)
-            for k, mse in enumerate(fold_mses):
-                cv_mses[k].append(mse)
-
-            # Complexity: tree node count from the best individual found, exactly
-            # as the regressor stores it in fitness.values[-1].
-            if (
-                isinstance(trial_model, SymbolicRegressor)
-                and trial_model.best_individual_ is not None
-            ):
-                cv_complexities.append(
-                    float(trial_model.best_individual_.fitness.values[-1])  # type: ignore[attr-defined]
+                except Exception as error:
+                    # A hyperparameter combination that cannot be fitted is a
+                    # failed trial, not a failed run.
+                    logger.debug("Trial failed to fit: %s", error)
+                    raise optuna.TrialPruned() from error
+                if predicted.ndim == 1:
+                    predicted = predicted.reshape(-1, 1)
+                fold_scores.append(
+                    _score(targets[valid_index], predicted, names, self.settings.metric)
                 )
+                trial.report(float(np.mean(fold_scores)), index)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            return float(np.mean(fold_scores))
 
-            # Single-target scalar metric (used only when n_targets == 1)
-            if not is_multiobjective:
-                y_1d = y_val[:, 0] if y_val.ndim == 2 else y_val
-                p_1d = preds[:, 0] if preds.ndim == 2 else preds
-                cv_scalar.append(evaluate_metric(tuning_metric, y_1d, p_1d))
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=self.settings.seed),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+        )
+        logger.info(
+            "Tuning %r: %d trials, %d inner folds, objective %s.",
+            self.learner_name,
+            self.settings.n_trials,
+            self.settings.inner_splits,
+            self.settings.metric,
+        )
+        study.optimize(
+            objective,
+            n_trials=self.settings.n_trials,
+            timeout=self.settings.timeout,
+            catch=(Exception,),
+        )
 
-        if is_multiobjective:
-            # Objective vector: CV-mean MSE per target + CV-mean complexity
-            mean_mses = tuple(float(np.mean(cv_mses[k])) for k in range(n_targets))
-            mean_complexity = float(np.mean(cv_complexities)) if cv_complexities else 0.0
-            result = mean_mses + (mean_complexity,)
-            logger.debug(
-                "Multi-objective CV result",
-                extra={"mean_mses": mean_mses, "mean_complexity": mean_complexity},
+        completed = [t for t in study.trials if t.value is not None]
+        self.n_trials_completed_ = len(completed)
+        if not completed:
+            logger.warning(
+                "Every tuning trial failed for %r; falling back to the configured "
+                "hyperparameters.",
+                self.learner_name,
             )
-            return result
-        else:
-            mean_score = float(np.mean(cv_scalar))
-            logger.debug(f"CV score: {mean_score}")
-            return mean_score
+            self.model_ = self._build({}, {})
+            self.model_.fit(features, targets, feature_names, names)
+            return self
 
-    # ------------------------------------------------------------------
-    # Study construction
-    # ------------------------------------------------------------------
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
+        raw = dict(study.best_params)
+        pipeline_keys = {"feature_space", "refine_power_law"}
+        self.best_pipeline_params_ = {k: v for k, v in raw.items() if k in pipeline_keys}
+        self.inner_score_ = float(study.best_value)
 
-    if is_multiobjective:
-        # n_targets MSE objectives + 1 complexity objective, all minimised.
-        directions = ["minimize"] * (n_targets + 1)
-        sampler = optuna.samplers.NSGAIISampler(seed=seed)
-        study = optuna.create_study(directions=directions, sampler=sampler)
-        logger.debug(
-            f"Starting multi-objective hyperparameter tuning for "
-            f"{type(model).__name__} — {n_targets} MSE objectives + complexity, "
-            f"{n_trials} trials."
-        )
-    else:
-        direction = get_metric_direction(tuning_metric)
-        sampler = optuna.samplers.TPESampler(seed=seed)
-        study = optuna.create_study(direction=direction, sampler=sampler)
-        logger.debug(
-            f"Starting hyperparameter tuning for {type(model).__name__} with "
-            f"{n_trials} trials, optimizing {tuning_metric} ({direction})."
-        )
-
-    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
-
-    # ------------------------------------------------------------------
-    # Extract best hyperparameters
-    # ------------------------------------------------------------------
-    if is_multiobjective:
-        # study.best_trials is the full Pareto front — pick using mean MSE
-        # across target objectives, mirroring _best_by_mean_mse in the regressor.
-        pareto_trials = study.best_trials
-        if not pareto_trials:
-            logger.warning("No Pareto-optimal trials found; returning original model.")
-            return model
-        best_trial = _select_best_trial_multiobjective(pareto_trials, n_targets)
-        best_mean_mse = float(np.mean(best_trial.values[:n_targets]))  # type: ignore[index]
-        logger.debug(
-            f"Best Pareto trial — mean MSE across targets: {best_mean_mse:.6f}, "
-            f"complexity: {best_trial.values[n_targets]:.1f}, "  # type: ignore[index]
-            f"params: {best_trial.params}"
-        )
-    else:
+        # Re-sample the winning trial through the space functions so derived
+        # parameters (such as the hidden-layer tuple built from width and depth)
+        # are reconstructed exactly as they were during the trial.
         best_trial = study.best_trial
-        logger.debug(
-            f"Best hyperparameters found: {best_trial.params} "
-            f"({tuning_metric}={best_trial.value:.6f})"
+        fixed = optuna.trial.FixedTrial(best_trial.params)
+        learner_params = space(fixed) if space is not None else {}
+        pipeline_params = _pipeline_space(fixed) if self.settings.search_pipeline else {}
+        self.best_params_ = {"learner": learner_params, "pipeline": pipeline_params}
+
+        logger.info(
+            "Best inner %s = %.4f over %d completed trials; params %s",
+            self.settings.metric,
+            self.inner_score_,
+            self.n_trials_completed_,
+            best_trial.params,
         )
 
-    best_params = best_trial.params
+        self.model_ = self._build(learner_params, pipeline_params)
+        self.model_.fit(features, targets, feature_names, names)
+        return self
 
-    best_model = copy.deepcopy(model)
-    if isinstance(best_model, SymbolicRegressor):
-        best_model.population_size = best_params["population_size"]
-        best_model.generations = best_params["generations"]
-        best_model.mutation_rate = best_params["mutation_rate"]
-        best_model.crossover_rate = best_params["crossover_rate"]
-        best_model.tournament_size = best_params["tournament_size"]
-        best_model.max_tree_height = best_params["max_tree_height"]
-        best_model.n_islands = best_params["n_islands"]
-        best_model.migration_interval = best_params["migration_interval"]
-        best_model.migration_size = best_params["migration_size"]
-        best_model.simplify_interval = best_params["simplify_interval"]
-        best_model.parsimony_coefficient = best_params["parsimony_coefficient"]
-        best_model.basic_arithmetic_only = best_params["basic_arithmetic_only"]
-        best_model.const_opt_top_k_ratio = best_params["const_opt_top_k_ratio"]
+    # -- delegation ----------------------------------------------------- #
 
-    return best_model
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        if self.model_ is None:
+            raise ValueError("Model has not been fit yet.")
+        return self.model_.predict(features)
+
+    def get_fit_details(self) -> dict[str, Any]:
+        if self.model_ is None:
+            raise ValueError("Model has not been fit yet.")
+        details = self.model_.get_fit_details()
+        details["tuning"] = {
+            "learner": self.learner_name,
+            "metric": self.settings.metric,
+            "inner_score": self.inner_score_,
+            "n_trials_completed": self.n_trials_completed_,
+            "best_params": self.best_params_,
+        }
+        return details
+
+    def closed_form(self) -> dict[str, str]:
+        if self.model_ is None:
+            raise ValueError("Model has not been fit yet.")
+        return self.model_.closed_form()
+
+    @property
+    def structure_(self):  # noqa: D401 - passthrough for downstream consumers
+        """The fitted target structure, for callers that reach through."""
+        return None if self.model_ is None else self.model_.structure_
+
+    @property
+    def target_models_(self):
+        return {} if self.model_ is None else self.model_.target_models_
+
+    def prepare_columns(self, features: np.ndarray) -> dict[str, np.ndarray]:
+        if self.model_ is None:
+            raise ValueError("Model has not been fit yet.")
+        return self.model_.prepare_columns(features)
+
+
+def tuned_model_factory(
+    learner_name: str,
+    config: ProxyConfig,
+    settings: TuningSettings,
+) -> Callable[[], TunedProxyModel]:
+    """A zero-argument factory, as the validation protocols expect."""
+
+    def factory() -> TunedProxyModel:
+        return TunedProxyModel(
+            learner_name=learner_name, config=config, settings=settings
+        )
+
+    return factory

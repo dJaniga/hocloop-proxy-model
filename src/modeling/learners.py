@@ -332,8 +332,40 @@ LEARNER_FACTORIES: dict[str, Any] = {
 }
 
 
+def _apply_override(learner: Any, name: str, key: str, value: Any) -> None:
+    """Set one hyperparameter, whichever kind of object the learner is.
+
+    The dataclass learners defined here take plain attributes, while the
+    scikit-learn baselines are estimators and pipelines whose nested parameters
+    are reachable only through ``set_params`` with a ``step__param`` path.
+    Silently ignoring an unknown key would let a tuning run report scores for
+    hyperparameters it never actually applied, so an unusable key raises.
+    """
+    if hasattr(learner, "set_params"):
+        try:
+            valid = learner.get_params(deep=True)
+        except Exception:
+            valid = {}
+        if key in valid:
+            learner.set_params(**{key: value})
+            return
+    if hasattr(learner, key):
+        setattr(learner, key, value)
+        return
+    raise AttributeError(
+        f"{name!r} learner has no hyperparameter {key!r}. "
+        f"For a scikit-learn pipeline use a 'step__param' path."
+    )
+
+
 def build_learner_factory(name: str, **overrides: Any) -> Any:
-    """Return a zero-argument factory for the named learner."""
+    """Return a zero-argument factory for the named learner.
+
+    Unknown override keys are dropped with a warning rather than raising, so a
+    shared set of overrides (a reduced search budget, say) can be handed to
+    every learner without the caller having to know which ones accept it.
+    Keys the learner does recognise are always applied.
+    """
     if name not in LEARNER_FACTORIES:
         raise KeyError(f"Unknown learner {name!r}. Known: {sorted(LEARNER_FACTORIES)}")
     if not overrides:
@@ -344,9 +376,10 @@ def build_learner_factory(name: str, **overrides: Any) -> Any:
     def factory() -> Any:
         learner = base()
         for key, value in overrides.items():
-            if not hasattr(learner, key):
-                raise AttributeError(f"{name!r} learner has no attribute {key!r}.")
-            setattr(learner, key, value)
+            try:
+                _apply_override(learner, name, key, value)
+            except AttributeError as error:
+                logger.debug("Ignoring override for %r: %s", name, error)
         return learner
 
     return factory

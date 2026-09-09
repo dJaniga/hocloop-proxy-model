@@ -123,13 +123,23 @@ def learner_comparison(
     targets: np.ndarray,
     features_name: Sequence[str],
     targets_name: Sequence[str],
+    model_factory_for: Callable[[str, Callable[[], Any]], Callable[[], Any]] | None = None,
     **kwargs: Any,
 ) -> list[BenchmarkEntry]:
-    """Swap the stage-3 learner, holding every other stage fixed."""
+    """Swap the stage-3 learner, holding every other stage fixed.
+
+    ``model_factory_for`` maps a learner label and its factory to the model
+    factory actually evaluated.  It is the hook the hyperparameter search uses:
+    returning a self-tuning model there makes every entry in the table a nested
+    cross-validation, because the search only ever sees an outer training split.
+    """
     entries: list[BenchmarkEntry] = []
     for label, learner_factory in learner_factories.items():
-        def model_factory(_factory=learner_factory) -> StructuredProxyModel:
-            return StructuredProxyModel(learner_factory=_factory, config=config)
+        if model_factory_for is not None:
+            model_factory = model_factory_for(label, learner_factory)
+        else:
+            def model_factory(_factory=learner_factory) -> StructuredProxyModel:
+                return StructuredProxyModel(learner_factory=_factory, config=config)
 
         entries.append(
             evaluate_configuration(

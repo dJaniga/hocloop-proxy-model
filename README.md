@@ -166,6 +166,50 @@ everywhere can still score negatively. `r2_log_score` (R² on logs) and
 quote for these targets. The residual negative raw R² values at small training
 sizes are a property of the metric, not a defect in the model.
 
+## Hyperparameter optimisation
+
+`modeling/tuning.py` adds an Optuna search, off by default:
+
+```bash
+uv run src/main.py ... --tune --n-trials 40 --inner-splits 3
+```
+
+The search runs **inside** `TunedProxyModel.fit`, using only the data that call
+receives. This is the whole design: every protocol in `modeling/validation`
+already refits the model on each training split, so a model that tunes itself
+during `fit` produces proper nested cross-validation for free, and the search
+can never see the fold it is scored on. Tuning once on the full design and then
+cross-validating the winner would report the score of a model chosen with
+knowledge of the test data.
+
+Two groups can be searched:
+
+- **Learner hyperparameters** — GP budget and pressure (`population_size`,
+  `generations`, `max_tree_height`, `parsimony_coefficient`, `n_islands`,
+  operator set, and for `symbolic_deap` also tournament size and the crossover
+  and mutation rates); PySR's iteration and size budget; and the usual knobs of
+  the black-box baselines.
+- **Pipeline choices** (`--tune-pipeline`) — the feature space and the
+  power-law refinement switch, which are hyperparameters like any other.
+
+The objective defaults to `r2_log_score` rather than raw R², because on a target
+spanning four orders of magnitude the raw score is decided by a handful of
+extreme points, and tuning against a noisy objective mostly fits the noise.
+Trials are pruned with a median pruner on the inner folds, and a combination
+that cannot be fitted is pruned rather than aborting the run.
+
+The ablation deliberately does **not** tune: it isolates the contribution of a
+pipeline stage, and letting the search compensate for a removed stage would
+confound exactly what the table is meant to measure.
+
+Cost is `n_trials` × `inner_splits` fits per model fit, and the protocols fit
+many models — so tuning the genetic-programming learners over a full study is
+expensive. Use `--tune-learners` to restrict it, and note that `power_law_ols`
+has nothing to tune and is skipped automatically.
+
+Best hyperparameters and the inner score are written to `hyperparameters.json`
+and included in `final_model.json` under `tuning`.
+
 ## Design rules
 
 `modeling/design_rules` differentiates the fitted closed form. For a levelised
