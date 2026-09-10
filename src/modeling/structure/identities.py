@@ -68,6 +68,12 @@ class TargetIdentity:
     quality: IdentityQuality
     parameters: dict[str, Any] = field(default_factory=dict)
     evaluate: Callable[[dict[str, np.ndarray], dict[str, np.ndarray]], np.ndarray] | None = None
+    #: The reconstruction as a Python expression in the source columns, at full
+    #: precision.  ``expression`` is written for a reader and shows the
+    #: derivation; this one is meant to be evaluated and must reproduce
+    #: :attr:`evaluate` exactly.  ``None`` when no closed form can be rendered,
+    #: which happens for a multivariate polynomial fitted through a pipeline.
+    evaluable: str | None = None
 
     def __call__(
         self,
@@ -85,6 +91,7 @@ class TargetIdentity:
             "source_features": list(self.source_features),
             "kind": self.kind,
             "expression": self.expression,
+            "evaluable": self.evaluable,
             "quality": self.quality.to_dict(),
             "parameters": jsonable(self.parameters),
         }
@@ -195,15 +202,23 @@ def jsonable(value: Any) -> Any:
     return value
 
 
-def format_polynomial(coefficients: Sequence[float], variable: str) -> str:
-    """Render polynomial coefficients (highest power first) as a formula string."""
+def format_polynomial(
+    coefficients: Sequence[float], variable: str, digits: int = 9
+) -> str:
+    """Render polynomial coefficients (highest power first) as a formula string.
+
+    ``digits`` trades readability against exactness: the default suits a printed
+    formula, while 17 digits round-trips a float and is what the evaluable form
+    uses so it reproduces the model's predictions exactly.
+    """
     degree = len(coefficients) - 1
     parts: list[str] = []
     for power, coefficient in zip(range(degree, -1, -1), coefficients):
+        rendered = f"{coefficient:.{digits}g}"
         if power == 0:
-            parts.append(f"{coefficient:.9g}")
+            parts.append(rendered)
         elif power == 1:
-            parts.append(f"{coefficient:.9g}*{variable}")
+            parts.append(f"{rendered}*{variable}")
         else:
-            parts.append(f"{coefficient:.9g}*{variable}**{power}")
+            parts.append(f"{rendered}*{variable}**{power}")
     return " + ".join(parts)

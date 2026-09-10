@@ -166,6 +166,52 @@ everywhere can still score negatively. `r2_log_score` (R² on logs) and
 quote for these targets. The residual negative raw R² values at small training
 sizes are a property of the metric, not a defect in the model.
 
+## The exported formula is the model
+
+`closed_form()` and `final_model.json` are the numbers a paper quotes, so they
+carry a hard guarantee: **evaluating the printed formula on the raw feature
+columns reproduces the model's own predictions to machine precision.**
+
+That does not come for free, and three things had to be right for it to hold.
+
+*Standardisation.* The genetic search evolves on standardised features and a
+standardised target, so `str(best_individual)` is a function of scaled
+variables. Printed next to unscaled column names it silently means something
+else — it was out by a factor of 7 in absolute terms. Each variable is now
+back-substituted as `(v - mean) / std` and the result rescaled by the target
+statistics, so the exported expression is a function of the columns it names.
+The scaled form is still exported as `expression_scaled`, along with the
+standardisation constants, for reproducibility.
+
+*Precision.* Coefficients are printed at 17 significant digits, not 6. Six
+digits left a relative error of ~1e-5 in the reconstructed prediction.
+
+*Every step of the inverse transform.* The Duan smearing factor is a
+multiplicative constant of a few percent applied on the way back from log space,
+and omitting it from the formula produced a silent 2.5% bias. It now appears
+explicitly. The only step deliberately omitted is the clip to the observed
+target range, which binds on no fitted sample.
+
+`closed_form_report()` (written into `final_model.json`) ships the definitions
+needed to evaluate the formula: the response scale, the smearing factor, the Pi
+group definitions, and any discovered derived variable such as
+`depth_plus_l_horiz = depth + l_horiz`. With those, the artefact alone
+reconstructs the model:
+
+```
+w_out  = (k_rock * gradT * depth_plus_l_horiz * depth) * 1.0466087039198544 * exp(...)
+LCOH   = (7.8660102900587517e-07*(depth + l_horiz)**2 + ...) / w_out
+LCOH_i = (1.6834486840897337e-05*(depth + l_horiz)**2 + ...) / w_out
+```
+
+Verified against `predictions_full_fit.csv` from raw features alone: max
+relative error 2.9e-14 on all three targets.
+
+Note that `/` is printed as ordinary division, so the small-denominator guard
+used during evolution is not reproduced; it differs only where a denominator is
+within 1e-12 of zero. Pareto-front entries are reported as `expression_scaled`,
+since they are alternatives considered rather than the exported model.
+
 ## Hyperparameter optimisation
 
 `modeling/tuning.py` adds an Optuna search, off by default:

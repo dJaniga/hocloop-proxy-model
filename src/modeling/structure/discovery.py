@@ -227,6 +227,10 @@ class PolynomialModel:
     expression: str
     parameters: dict[str, Any]
     _predict: Any
+    #: The same polynomial at full float precision, so an exported formula
+    #: reproduces the fit exactly.  ``None`` for the multivariate case, which is
+    #: fitted through a scaler and has no compact closed form to print.
+    exact_expression: str | None = None
 
     def predict(self, feature_values: dict[str, np.ndarray]) -> np.ndarray:
         columns = [aggregate.values(feature_values) for aggregate in self.aggregates]
@@ -261,6 +265,7 @@ def _fit_polynomial(
             aggregates=tuple(aggregates),
             degree=degree,
             expression=format_polynomial(coefficients, aggregates[0].name),
+            exact_expression=format_polynomial(coefficients, aggregates[0].name, digits=17),
             parameters={
                 "coefficients_highest_power_first": [float(c) for c in coefficients],
                 "variable": aggregates[0].name,
@@ -463,6 +468,7 @@ def _proportional_candidate(
         source_features=(),
         kind="proportional",
         expression=f"{target} = {factor:.12g} * {source}",
+        evaluable=f"{factor:.17g} * {source}",
         quality=quality,
         parameters={"factor": factor},
         evaluate=evaluate,
@@ -493,6 +499,7 @@ def _affine_candidate(
         source_features=(),
         kind="affine",
         expression=f"{target} = {slope:.12g} * {source} + {intercept:.12g}",
+        evaluable=f"{slope:.17g} * {source} + {intercept:.17g}",
         quality=quality,
         parameters={"slope": slope, "intercept": intercept},
         evaluate=evaluate,
@@ -566,6 +573,11 @@ def _product_polynomial_candidate(
             f"{target} {symbol} {source} = {polynomial.expression}"
             f"   =>   {target} = ({polynomial.expression}) {inverse} {source}"
         ),
+        evaluable=(
+            None
+            if polynomial.exact_expression is None
+            else f"({polynomial.exact_expression}) {inverse} {source}"
+        ),
         quality=quality,
         parameters={
             "combination": combination,
@@ -606,6 +618,7 @@ def _feature_polynomial_candidate(
         source_features=polynomial.feature_names,
         kind="feature_polynomial",
         expression=f"{target} = {polynomial.expression}",
+        evaluable=polynomial.exact_expression,
         quality=quality,
         parameters={
             "degree": polynomial.degree,

@@ -57,6 +57,9 @@ class SymbolicLearner:
 
     model_: Any = None
     expression_: str | None = None
+    #: The tree exactly as evolved, in standardised variables. Kept for
+    #: reproducibility; :attr:`expression_` is the one that can be evaluated.
+    expression_scaled_: str | None = None
     pareto_: list[dict[str, Any]] = field(default_factory=list)
     fit_details_: dict[str, Any] = field(default_factory=dict)
 
@@ -81,11 +84,19 @@ class SymbolicLearner:
             seed=self.seed,
         )
         self.model_.fit(X, y, features_name=names, targets_name=("response",))
-        self.expression_ = str(self.model_.best_individual_)
+        # The tree is evolved on standardised columns, so the scaled string is
+        # not a function of the columns it names. Export the rewritten form,
+        # which evaluates to the model's own predictions.
+        self.expression_scaled_ = str(self.model_.best_individual_)
+        self.expression_ = (
+            self.model_.expression_in_original_units() or self.expression_scaled_
+        )
         self.fit_details_ = self.model_.get_fit_details()
         self.pareto_ = [
             {
-                "expression": str(individual),
+                # Front entries are reported in standardised variables: they are
+                # alternatives considered, not the exported model.
+                "expression_scaled": str(individual),
                 "complexity": float(individual.fitness.values[-1]),
                 "mse": float(individual.fitness.values[0]),
             }
@@ -186,8 +197,10 @@ class PowerLawLearner:
         y = np.asarray(y, dtype=np.float64).ravel()
         self.model_ = LinearRegression().fit(X, y)
         names = self.feature_names or tuple(f"x{i}" for i in range(X.shape[1]))
-        terms = [f"{coefficient:+.6g}*{name}" for coefficient, name in zip(self.model_.coef_, names)]
-        self.expression_ = f"{self.model_.intercept_:.6g} " + " ".join(terms)
+        # Full precision: the exported string is meant to reproduce the model's
+        # predictions exactly, and six significant digits does not.
+        terms = [f"{coefficient:+.17g}*{name}" for coefficient, name in zip(self.model_.coef_, names)]
+        self.expression_ = f"{self.model_.intercept_:.17g} " + " ".join(terms)
         self.fit_details_ = {
             "coefficients": self.model_.coef_.tolist(),
             "intercept": float(self.model_.intercept_),

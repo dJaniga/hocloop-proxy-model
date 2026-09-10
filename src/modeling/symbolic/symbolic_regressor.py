@@ -372,6 +372,68 @@ class SymbolicRegressor(Regressor):
 
     # ---- public API --------------------------------------------------------
 
+    def expression_in_original_units(self) -> str | None:
+        """The best expression rewritten to take unscaled inputs and return unscaled output.
+
+        Evolution runs on standardised features and a standardised target, so
+        ``str(best_individual_)`` is a function of *scaled* variables.  Printed
+        as-is next to unscaled column names it silently means something else and
+        does not reproduce the model's own predictions, which makes it useless
+        as the closed form quoted in a paper.
+
+        Each variable is therefore substituted with ``(v - mean) / std`` and the
+        result rescaled by the target statistics, giving an expression that can
+        be evaluated directly on the columns it names.  ``Abs`` and ``sqrt``
+        appear as themselves; division is printed as ordinary division, so the
+        small-denominator guard used during evolution is not reproduced, which
+        matters only where a denominator is within 1e-12 of zero.
+
+        Returns ``None`` when the tree cannot be converted, in which case
+        callers should fall back to the scaled form and say so.
+        """
+        if self.best_individual_ is None or self._pset is None:
+            raise ValueError("Model has not been fit yet.")
+        if self._feature_mean is None or self._feature_std is None:
+            return None
+
+        import sympy
+
+        from .algebraic_simplification import _deap_to_sympy, _get_sympy_symbols
+
+        n_features = len(self._feature_mean)
+        expression = _deap_to_sympy(self.best_individual_, n_features)
+        if expression is None:
+            return None
+
+        names = self.features_name or tuple(f"ARG{i}" for i in range(n_features))
+        placeholders = _get_sympy_symbols(n_features)
+        substitutions = {
+            placeholders[index]: (
+                sympy.Symbol(names[index]) - sympy.Float(float(self._feature_mean[index]))
+            )
+            / sympy.Float(float(self._feature_std[index]))
+            for index in range(n_features)
+        }
+        try:
+            rescaled = expression.subs(substitutions, simultaneous=True)
+            target_mean = float(np.ravel(self._target_mean)[0])
+            target_std = float(np.ravel(self._target_std)[0])
+            rescaled = rescaled * sympy.Float(target_std) + sympy.Float(target_mean)
+            return str(rescaled)
+        except Exception:  # pragma: no cover - defensive; reporting must not abort a fit
+            logger.warning("Could not rewrite the expression into original units.")
+            return None
+
+    def scaling_(self) -> dict[str, Any]:
+        """Standardisation statistics, needed to interpret the scaled expression."""
+        return {
+            "feature_names": list(self.features_name or ()),
+            "feature_mean": None if self._feature_mean is None else list(map(float, self._feature_mean)),
+            "feature_std": None if self._feature_std is None else list(map(float, self._feature_std)),
+            "target_mean": float(np.ravel(self._target_mean)[0]),
+            "target_std": float(np.ravel(self._target_std)[0]),
+        }
+
     def get_fit_details(self) -> dict[str, Any]:
         if self.best_individual_ is None:
             raise ValueError("Model has not been fit yet.")
@@ -379,7 +441,12 @@ class SymbolicRegressor(Regressor):
         details: dict[str, Any] = {
             "pareto_size": len(self.pareto_front_),
             "best_complexity": fv[-1],
-            "expression": str(self.best_individual_),
+            # The tree as evolved: a function of standardised variables.
+            "expression_scaled": str(self.best_individual_),
+            # The same tree in the units of the columns it names, so it can be
+            # evaluated and quoted directly.
+            "expression": self.expression_in_original_units() or str(self.best_individual_),
+            "standardisation": self.scaling_(),
             "n_targets": self._n_targets,
         }
         if self._n_targets == 1:

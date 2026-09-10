@@ -424,7 +424,15 @@ def pipeline(
     )
     _write_json(
         output_path / "final_model.json",
-        {"details": details, "closed_form": model.closed_form()},
+        {
+            "details": details,
+            "closed_form": model.closed_form(),
+            "closed_form_report": (
+                model.closed_form_report()
+                if hasattr(model, "closed_form_report")
+                else None
+            ),
+        },
     )
 
     predictions = np.asarray(model.predict(features), dtype=np.float64)

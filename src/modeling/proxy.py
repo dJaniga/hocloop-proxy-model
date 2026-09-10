@@ -471,7 +471,17 @@ class StructuredProxyModel(Regressor):
         }
 
     def closed_form(self) -> dict[str, str]:
-        """Human-readable formula for every target, when the learner provides one."""
+        """Formula per target that evaluates to the model's own predictions.
+
+        Everything the inverse transform applies has to appear here, or the
+        printed formula quietly means something other than the fitted model.
+        That includes the Duan smearing factor, which is a multiplicative
+        constant of a few percent and is easy to omit by mistake.
+
+        The only step deliberately left out is the clip to the observed target
+        range, which binds on no sample the model was fitted to and would make
+        the expression unreadable.
+        """
         formulas: dict[str, str] = {}
         for name, model in self.target_models_.items():
             expression = getattr(model.learner, "expression_", None)
@@ -481,11 +491,44 @@ class StructuredProxyModel(Regressor):
             scale = (
                 model.pi_basis.scale_formula() if model.pi_basis is not None else "1"
             )
+            smearing = float(getattr(model.response, "smearing", 1.0))
             if self.config.log_response:
-                formulas[name] = f"({scale}) * exp({expression})"
+                formulas[name] = f"({scale}) * {smearing:.17g} * exp({expression})"
             else:
                 formulas[name] = f"({scale}) * ({expression})"
         if self.structure_ is not None:
             for name in self.structure_.reconstruction_order():
-                formulas[name] = self.structure_.identities[name].expression
+                identity = self.structure_.identities[name]
+                # Prefer the evaluable rendering; fall back to the derivation
+                # text, which reads well but is not a Python expression.
+                formulas[name] = identity.evaluable or identity.expression
         return formulas
+
+    def closed_form_report(self) -> dict[str, Any]:
+        """Formulas plus everything needed to evaluate them.
+
+        A formula is only reproducible alongside the definitions of the columns
+        it names, so the Pi group definitions and the response scale travel with
+        it rather than living in a separate file.
+        """
+        report: dict[str, Any] = {"formulas": self.closed_form(), "definitions": {}}
+        for name, model in self.target_models_.items():
+            entry: dict[str, Any] = {
+                "response_scale": (
+                    model.pi_basis.scale_formula() if model.pi_basis is not None else "1"
+                ),
+                "smearing": float(getattr(model.response, "smearing", 1.0)),
+                "design_columns": list(model.feature_space.names),
+            }
+            if model.pi_basis is not None:
+                entry["pi_groups"] = {
+                    group.name: group.formula()
+                    for group in model.pi_basis.predictor_groups
+                }
+            report["definitions"][name] = entry
+        if self.derived_variables_:
+            report["derived_variables"] = {
+                name: " + ".join(members)
+                for name, (members, _) in self.derived_variables_.items()
+            }
+        return report
