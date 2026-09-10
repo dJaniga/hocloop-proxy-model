@@ -10,7 +10,7 @@
     "l_horiz": "m"
   },
   "targets": {
-    "w_out": "W",
+    "w_out": "kW",
     "LCOH": "1",
     "LCOH_i": "1"
   },
