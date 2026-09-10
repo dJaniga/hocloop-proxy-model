@@ -1,0 +1,38 @@
+# Experiment configuration for the HOCLOOP closed-loop geothermal study.
+#
+# Both sections accept:
+#   include: columns to use, in this order. Omit to take every column present.
+#   exclude: columns to drop from whatever include left.
+#   units:   flat unit string per column, used by the dimensional stage.
+#
+# Unit syntax: symbols joined by * and /, optional integer or fractional power
+# with ^, optional decimal prefix (n u m c d k M G T), and a bare number as a
+# scale factor. So kW, 1000*W, J/m^3/K, E/kWh and cE/kWh are all valid.
+# Currency symbols: E, EUR, "€", USD, "$". Use "1" for a dimensionless column.
+
+features:
+  include:
+    - k_rock
+    - rho_cp_rock
+    - gradT
+    - u_inf
+    - mass_flow
+    - depth
+    - l_horiz
+  units:
+    k_rock: W/m/K
+    rho_cp_rock: J/m^3/K
+    gradT: K/m
+    u_inf: "1"          # base-10 log of a Darcy velocity, so dimensionless
+    mass_flow: kg/s
+    depth: m
+    l_horiz: m
+
+targets:
+  include:
+    - w_out
+    - LCOH
+  units:
+    w_out: kW
+    LCOH: E/kWh
+

@@ -425,6 +425,13 @@ class StructuredProxyModel(Regressor):
             for member in members:
                 total = total + columns[member]
             columns[name] = total
+
+        # Declared constants take part in the Pi construction at fit time, so a
+        # response scale can name one. Without them here, predicting with such a
+        # model raises KeyError on the constant.
+        length = len(next(iter(columns.values())))
+        for name, (value, _unit) in self.config.physical_constants.items():
+            columns[name] = np.full(length, float(value), dtype=np.float64)
         return columns
 
     def predict(self, features: np.ndarray) -> np.ndarray:
