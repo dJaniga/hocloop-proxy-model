@@ -309,7 +309,7 @@ its absence is reported rather than allowed to abort the suite.
 uv run src/main.py \
   --features-file data_source/lhc_parameters.csv \
   --targets-file  data_source/lhc_results.csv \
-  --units-file    data_source/units.json \
+  --config        config/example.yaml \
   --output-path   results/study
 ```
 
@@ -333,18 +333,76 @@ Add `--quick` for a smoke run with a small genetic-programming budget.
 | `--skip-*` | no | Skip benchmarks, ablation, learning curve, conformal or design rules |
 | `--quick` | no | Small budget smoke run |
 
-### Units file
+### Configuration file
 
-```json
-{
-  "features": {"k_rock": "W/m/K", "depth": "m"},
-  "targets":  {"w_out": "W"}
-}
+`--config` takes a YAML (or JSON) file declaring which columns to use and their
+units. Both are the same decision seen from two angles — dropping a feature and
+failing to give it a unit both remove it from the dimensional stage — so they
+live in one file. See `config/example.yaml`.
+
+```yaml
+features:
+  include: [k_rock, gradT, mass_flow, depth, l_horiz]   # omit to use every column
+  exclude: [u_inf]                                      # applied after include
+  units:
+    k_rock: W/m/K
+    depth: m
+targets:
+  include: [w_out, LCOH]
+  units:
+    w_out: kW
+    LCOH: E/kWh
 ```
 
-Symbols `kg m s K A mol cd N Pa J W`, joined with `*` and `/`, optional integer
-powers with `^`, and `1` for dimensionless. Only the flat form is accepted, so a
-bracketing mistake cannot pass silently.
+Naming a column the data does not contain is an error rather than an ignored
+line, since a typo there would otherwise quietly change the experiment. The
+older shape, where `features` and `targets` map a name straight to a unit
+string, still works and is read as units with no selection.
+
+### Unit syntax
+
+Symbols joined by `*` and `/`, each optionally raised to an integer or
+fractional power with `^`, each optionally carrying a decimal prefix, and a bare
+number as a scale factor. Only the flat form is accepted — no brackets — because
+a mis-parsed unit corrupts every Pi group derived from it.
+
+| | |
+|---|---|
+| base | `kg g m s h K A mol cd` |
+| derived | `N Pa J W Wh` |
+| currency | `E EUR € USD $` |
+| prefixes | `n u µ m c d k M G T` |
+| other | `1` or `-` dimensionless, `%` |
+
+So `kW`, `1000*W`, `MW`, `J/m^3/K`, `E/kWh`, `cE/kWh` and `EUR/kWh` all parse.
+An exact symbol match always beats a prefix reading, which keeps `m` a metre
+rather than a milli-something and `cd` a candela rather than a centi-day. `E` is
+Euro, so exa is not offered as a prefix; `h` is an hour, so hecto is not either.
+
+Units carry a **scale** as well as a dimension. Scale never changes a fitted
+model: a dimensionless group stays dimensionless whichever multiple of a unit
+its variables use, and a constant factor in the response scale is absorbed by
+the fitted coefficient — switching `w_out` from `W` to `kW` leaves every reported
+number identical. It is tracked for two reasons: reporting a formula in the
+units the data is tabulated in, and catching the one case where ignoring it is
+silently wrong — summing columns of the same dimension but different scale, such
+as a depth in metres with a length in kilometres, which is now converted rather
+than added raw.
+
+**Currency is a base dimension.** A levelised cost in `E/kWh` is therefore
+dimensionally distinct from a pure number, and a parameter table containing no
+other monetary quantity has no way to make such a target dimensionless. When
+that target has to be learnt directly the Pi stage says so and steps aside:
+
+```
+Pi reduction unavailable for 'LCOH': 'LCOH' has dimension M^-1*L^-2*T^2*Currency,
+and no feature carries Currency, so no product of the features can cancel it.
+Declare a feature or constant with that dimension, or leave 'LCOH' to be
+reconstructed from another target.
+```
+
+In the default setup this never arises, because `LCOH` is reconstructed from
+`w_out` through an exact identity rather than learnt.
 
 ## Output artefacts
 

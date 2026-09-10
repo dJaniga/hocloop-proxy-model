@@ -26,14 +26,14 @@ from __future__ import annotations
 
 import itertools
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Mapping, Sequence
 
 import numpy as np
 import sympy as sp
 
-from modeling.features.units import Dimension, parse_unit
+from modeling.features.units import Dimension, convert_factor, parse_unit, parse_quantity
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,9 @@ class PiBasis:
     repeating: tuple[str, ...]
     response_group: PiGroup
     predictor_groups: tuple[PiGroup, ...]
+    #: Unit string of every variable involved, so a reported group can be read
+    #: in the units the data is actually tabulated in.
+    units: dict[str, str] = field(default_factory=dict)
 
     @property
     def scale_exponents(self) -> dict[str, Fraction]:
@@ -147,7 +150,47 @@ class PiBasis:
             "response_group": self.response_group.to_dict(),
             "response_scale": self.scale_formula(),
             "predictor_groups": [group.to_dict() for group in self.predictor_groups],
+            "units": dict(self.units),
         }
+
+
+def _unreachable_dimension_hint(
+    response: str,
+    dimensions: Mapping[str, Dimension],
+    feature_names: Sequence[str],
+) -> str:
+    """Explain a base dimension the response has and no feature can cancel.
+
+    The common case is a monetary response such as a levelised cost in E/kWh in
+    a parameter table that contains no other monetary quantity: no product of
+    the features can ever cancel currency, so no dimensionless group exists.
+    Saying so is far more useful than reporting that the search found nothing.
+    """
+    from modeling.features.units import BASE_DIMENSIONS
+
+    response_dimension = dimensions[response]
+    covered = {
+        index
+        for name in feature_names
+        for index in range(len(BASE_DIMENSIONS))
+        if dimensions[name].exponents[index] != 0
+    }
+    unreachable = [
+        BASE_DIMENSIONS[index]
+        for index in range(len(BASE_DIMENSIONS))
+        if response_dimension.exponents[index] != 0 and index not in covered
+    ]
+    if not unreachable:
+        return (
+            f"The features span the dimensions of {response!r} but no repeating set "
+            "of the required rank is dimensionally independent."
+        )
+    return (
+        f"{response!r} has dimension {response_dimension}, and no feature carries "
+        f"{', '.join(unreachable)}, so no product of the features can cancel it. "
+        f"Declare a feature or constant with that dimension, or leave {response!r} "
+        "to be reconstructed from another target."
+    )
 
 
 def _as_fraction(value: sp.Rational) -> Fraction:
@@ -249,6 +292,7 @@ def build_pi_basis(
         repeating=repeating,
         response_group=response_group,
         predictor_groups=predictor_groups,
+        units={**{name: feature_units[name] for name in names}, response: response_unit},
     )
 
 
@@ -336,7 +380,10 @@ def select_pi_basis(
         )
 
     if not scores:
-        raise ValueError("No admissible repeating set produced a usable Pi basis.")
+        raise ValueError(
+            "No admissible repeating set produced a usable Pi basis. "
+            + _unreachable_dimension_hint(response, dimensions, names)
+        )
 
     scores.sort(key=lambda score: score.log_std_response_group)
     best = scores[0]
@@ -420,6 +467,7 @@ def prune_redundant_groups(
         repeating=basis.repeating,
         response_group=basis.response_group,
         predictor_groups=pruned,
+        units=dict(basis.units),
     )
 
 
@@ -515,6 +563,7 @@ def refine_response_group(
         repeating=basis.repeating,
         response_group=refined_group,
         predictor_groups=basis.predictor_groups,
+        units=dict(basis.units),
     )
 
     report = {
@@ -578,15 +627,27 @@ def augment_with_derived_variables(
     new_columns = dict(columns)
     new_units = dict(units)
     for name, (members, unit) in derived.items():
-        member_dimension = parse_unit(units[members[0]])
+        reference_unit = units[members[0]]
+        reference_dimension = parse_unit(reference_unit)
         for member in members[1:]:
-            if parse_unit(units[member]) != member_dimension:
+            if parse_unit(units[member]) != reference_dimension:
                 raise ValueError(
-                    f"Cannot sum {members!r} into {name!r}: dimensions differ."
+                    f"Cannot sum {members!r} into {name!r}: dimensions differ "
+                    f"({units[members[0]]} against {units[member]})."
                 )
+        # Members may share a dimension but not a scale -- a depth in metres and
+        # a length in kilometres -- and adding those raw would be wrong without
+        # any error to show for it. Each member is converted to the first one's
+        # unit before summing.
         total = np.zeros_like(np.asarray(columns[members[0]], dtype=np.float64))
         for member in members:
-            total = total + np.asarray(columns[member], dtype=np.float64)
+            factor = convert_factor(units[member], reference_unit)
+            if factor != 1.0:
+                logger.info(
+                    "Converting %s from %s to %s (factor %g) before summing into %s.",
+                    member, units[member], reference_unit, factor, name,
+                )
+            total = total + factor * np.asarray(columns[member], dtype=np.float64)
         new_columns[name] = total
-        new_units[name] = unit
+        new_units[name] = unit or reference_unit
     return new_columns, new_units

@@ -39,11 +39,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-path", type=Path, help="Directory for all artefacts", required=True
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="YAML (or JSON) experiment configuration: which feature and target "
+        "columns to use, and their units. See config/example.yaml. Defaults to "
+        "every column in the data files and the built-in HOCLOOP units.",
+    )
+    parser.add_argument(
         "--units-file",
         type=Path,
         default=None,
-        help='JSON with {"features": {...}, "targets": {...}} mapping each column '
-        'to a flat unit string such as "W/m/K". Defaults to the built-in HOCLOOP units.',
+        help="Deprecated alias for --config, kept for existing scripts.",
     )
 
     parser.add_argument(
@@ -170,12 +177,15 @@ def main() -> None:
     args = parser.parse_args()
     setup_logging(args.verbose)
 
+    if args.units_file is not None and args.config is None:
+        logger.warning("--units-file is deprecated; use --config.")
+
     pipeline(
         args.features_file,
         args.targets_file,
         args.output_path,
-        units_file=args.units_file,
         settings=settings_from_args(args),
+        config_file=args.config or args.units_file,
     )
 
 

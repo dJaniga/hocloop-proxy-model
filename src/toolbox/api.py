@@ -34,6 +34,7 @@ from modeling.proxy import ProxyConfig, StructuredProxyModel
 from modeling.transforms import columns_from_matrix
 from modeling.tuning import LEARNER_SPACES, TunedProxyModel, TuningSettings
 from modeling.validation import learning_curve
+from toolbox.config import ExperimentConfigFile, load_config_file, validate_units
 
 logger = logging.getLogger(__name__)
 
@@ -126,28 +127,35 @@ def build_config(
     feature_names: Sequence[str],
     target_names: Sequence[str],
     units_file: Path | None = None,
+    config_file: ExperimentConfigFile | None = None,
 ) -> ProxyConfig:
-    """Assemble a :class:`ProxyConfig`, reading units from a file when given.
+    """Assemble a :class:`ProxyConfig` from the declared units.
 
-    The units file is JSON with ``features`` and ``targets`` objects mapping a
-    column name to a flat unit string.  Without units the dimensional stage is
-    switched off rather than guessed at, because a wrong dimension would produce
-    a confidently meaningless Pi group.
+    Units come from *config_file* when given, otherwise from *units_file*,
+    otherwise from the built-in HOCLOOP defaults.  Without a unit for every
+    feature the dimensional stage is switched off rather than guessed at,
+    because a wrong dimension produces a confidently meaningless Pi group.
     """
-    feature_units = dict(DEFAULT_FEATURE_UNITS)
-    target_units = dict(DEFAULT_TARGET_UNITS)
+    if config_file is None and units_file is not None:
+        config_file = load_config_file(units_file)
 
-    if units_file is not None:
-        payload = json.loads(Path(units_file).read_text(encoding="utf-8"))
-        feature_units = dict(payload.get("features", {}))
-        target_units = dict(payload.get("targets", {}))
-        logger.info("Loaded units from %s", units_file)
+    if config_file is not None and (config_file.features.units or config_file.targets.units):
+        feature_units = dict(config_file.features.units)
+        target_units = dict(config_file.targets.units)
+    else:
+        feature_units = dict(DEFAULT_FEATURE_UNITS)
+        target_units = dict(DEFAULT_TARGET_UNITS)
+
+    feature_units = {k: v for k, v in feature_units.items() if k in set(feature_names)}
+    target_units = {k: v for k, v in target_units.items() if k in set(target_names)}
+    validate_units(feature_units, "feature")
+    validate_units(target_units, "target")
 
     missing = [name for name in feature_names if name not in feature_units]
     if missing:
         logger.warning(
-            "No units for %s; dimensional reduction disabled. Supply --units-file "
-            "to enable it.",
+            "No units for %s; dimensional reduction disabled. Declare them in the "
+            "config file to enable it.",
             missing,
         )
         return ProxyConfig(
@@ -159,8 +167,28 @@ def build_config(
 
     return ProxyConfig(
         feature_units={name: feature_units[name] for name in feature_names},
-        target_units={name: target_units[name] for name in target_names if name in target_units},
+        target_units=target_units,
     )
+
+
+def select_columns(
+    feature_frame: pd.DataFrame,
+    target_frame: pd.DataFrame,
+    config_file: ExperimentConfigFile,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply the configured column selection to the loaded data."""
+    features = config_file.features.resolve(tuple(feature_frame.columns), "features")
+    targets = config_file.targets.resolve(tuple(target_frame.columns), "targets")
+
+    dropped_features = [c for c in feature_frame.columns if c not in features]
+    dropped_targets = [c for c in target_frame.columns if c not in targets]
+    if dropped_features:
+        logger.info("Excluding features: %s", dropped_features)
+    if dropped_targets:
+        logger.info("Excluding targets: %s", dropped_targets)
+    logger.info("Using %d features and %d targets.", len(features), len(targets))
+
+    return feature_frame.loc[:, list(features)], target_frame.loc[:, list(targets)]
 
 
 def _symbolic_factory(settings: ExperimentSettings) -> Callable[[], Any]:
@@ -378,6 +406,7 @@ def pipeline(
     output_path: Path,
     units_file: Path | None = None,
     settings: ExperimentSettings | None = None,
+    config_file: Path | None = None,
 ) -> StructuredProxyModel:
     """Run the whole study and write every artefact to *output_path*."""
     settings = settings or ExperimentSettings()
@@ -392,12 +421,16 @@ def pipeline(
             f"{len(target_frame)}; they must correspond row by row."
         )
 
+    experiment = load_config_file(config_file or units_file)
+    feature_frame, target_frame = select_columns(feature_frame, target_frame, experiment)
+
     feature_names = tuple(feature_frame.columns)
     target_names = tuple(target_frame.columns)
     features = feature_frame.to_numpy(dtype=np.float64)
     targets = target_frame.to_numpy(dtype=np.float64)
 
-    config = build_config(feature_names, target_names, units_file)
+    config = build_config(feature_names, target_names, config_file=experiment)
+    _write_json(output_path / "experiment_config.json", experiment.describe())
     symbolic_factory = _symbolic_factory(settings)
     primary_factory = _primary_model_factory(settings, config)
     if settings.tune:
