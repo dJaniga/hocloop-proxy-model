@@ -173,6 +173,19 @@ def _sympy_to_deap_tokens(
     return tokens
 
 
+def _rewrite(expression: sympy.Expr) -> sympy.Expr:
+    """Algebraic rewrite aimed at shortening a tree.
+
+    A cheaper rewrite (``cancel`` plus ``powsimp``) and a memo keyed on the tree
+    string were both measured here and neither paid.  The memo almost never hits,
+    because the key includes constants that the optimiser has just retuned per
+    individual, and the cheaper rewrite leaves longer trees whose extra
+    evaluation cost cancels the saving.  See the note on
+    ``SymbolicRegressor.simplify_interval``.
+    """
+    return sympy.simplify(sympy.nsimplify(expression, rational=False, tolerance=1e-8))
+
+
 def _simplify_individual(
     individual: gp.PrimitiveTree,
     pset: gp.PrimitiveSet,
@@ -199,8 +212,7 @@ def _simplify_individual(
         return False
 
     try:
-        simplified = sympy.nsimplify(sym_expr, rational=False, tolerance=1e-8)
-        simplified = sympy.simplify(simplified)
+        simplified = _rewrite(sym_expr)
     except Exception:
         return False
 
